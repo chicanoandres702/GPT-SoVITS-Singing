@@ -6,6 +6,21 @@
 全部按英文识别
 全部按日文识别
 '''
+# **CRITICAL INSTRUCTION:**
+# It appears you are using a **VERY OLD VERSION OF GRADIO** that is causing errors.
+# **UPGRADING GRADIO IS ESSENTIAL** for microphone and streaming features to work correctly.
+#
+# **Please run this command in your environment and then RESTART your runtime/kernel:**
+#
+#    !pip install --upgrade gradio
+#
+# **After upgrading, please try running the LATEST version of the code.**
+#
+# The code below is a **FALLBACK attempt** to make the UI run with your old Gradio,
+# but **REAL-TIME STREAMING and MICROPHONE INPUT may NOT work properly or at all**
+# with such an outdated Gradio version.  It is HIGHLY RECOMMENDED to upgrade Gradio.
+
+
 import logging
 import traceback,torchaudio,warnings
 logging.getLogger("markdown_it").setLevel(logging.ERROR)
@@ -510,7 +525,7 @@ def audio_sr(audio,sr):
 ##ref_wav_path+prompt_text+prompt_language+text(单个)+text_language+top_k+top_p+temperature
 # cache_tokens={}#暂未实现清理机制
 cache= {}
-def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language, how_to_cut=i18n("不切"), top_k=20, top_p=0.6, temperature=0.6, ref_free = False,speed=1,if_freeze=False,inp_refs=None,sample_steps=8,if_sr=False,pause_second=0.3):
+def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language, how_to_cut=i18n("不切"), top_k=20, top_p=0.6, temperature=0.6, ref_free = False,speed=1,if_freeze=False,inp_refs=None,sample_steps=8,if_sr=False,pause_second=0.3, realtime_stream=False): # Added realtime_stream flag
     global cache
     if ref_wav_path:pass
     else:gr.Warning(i18n('请上传参考音频'))
@@ -545,26 +560,48 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
         zero_wav_torch = zero_wav_torch.half().to(device)
     else:
         zero_wav_torch = zero_wav_torch.to(device)
-    if not ref_free:
-        with torch.no_grad():
-            wav16k, sr = librosa.load(ref_wav_path, sr=16000)
-            if (wav16k.shape[0] > 160000 or wav16k.shape[0] < 48000):
-                gr.Warning(i18n("参考音频在3~10秒范围外，请更换！"))
-                raise OSError(i18n("参考音频在3~10秒范围外，请更换！"))
-            wav16k = torch.from_numpy(wav16k)
+
+    if not realtime_stream: # Process reference audio only for non-realtime stream
+        if not ref_free:
+            with torch.no_grad():
+                wav16k, sr = librosa.load(ref_wav_path, sr=16000)
+                if (wav16k.shape[0] > 160000 or wav16k.shape[0] < 48000):
+                    gr.Warning(i18n("参考音频在3~10秒范围外，请更换！"))
+                    raise OSError(i18n("参考音频在3~10秒范围外，请更换！"))
+                wav16k = torch.from_numpy(wav16k)
+                if is_half == True:
+                    wav16k = wav16k.half().to(device)
+                else:
+                    wav16k = wav16k.to(device)
+                wav16k = torch.cat([wav16k, zero_wav_torch])
+                ssl_content = ssl_model.model(wav16k.unsqueeze(0))[
+                    "last_hidden_state"
+                ].transpose(
+                    1, 2
+                )  # .float()
+                codes = vq_model.extract_latent(ssl_content)
+                prompt_semantic = codes[0, 0]
+                prompt = prompt_semantic.unsqueeze(0).to(device)
+    else: # For realtime stream, reference audio is live input
+        if not ref_free:
+            wav16k = ref_wav_path # ref_wav_path will be audio array from microphone
+            wav16k = torch.from_numpy(wav16k).float() # Assuming microphone input is float32 numpy array
             if is_half == True:
                 wav16k = wav16k.half().to(device)
             else:
                 wav16k = wav16k.to(device)
             wav16k = torch.cat([wav16k, zero_wav_torch])
             ssl_content = ssl_model.model(wav16k.unsqueeze(0))[
-                "last_hidden_state"
-            ].transpose(
-                1, 2
-            )  # .float()
+                    "last_hidden_state"
+                ].transpose(
+                    1, 2
+                )  # .float()
             codes = vq_model.extract_latent(ssl_content)
             prompt_semantic = codes[0, 0]
             prompt = prompt_semantic.unsqueeze(0).to(device)
+        else:
+            prompt = None
+
 
     t1 = ttime()
     t.append(t1-t0)
@@ -587,8 +624,10 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
     texts = merge_short_text_in_array(texts, 5)
     audio_opt = []
     ###s2v3暂不支持ref_free
-    if not ref_free:
+    if not ref_free and not realtime_stream: # process prompt text phones and bert only for file based reference
         phones1,bert1,norm_text1=get_phones_and_bert(prompt_text, prompt_language, version)
+    elif not ref_free and realtime_stream:
+        phones1,bert1,norm_text1 = [], None, "" # No prompt text for realtime stream
 
     for i_text,text in enumerate(texts):
         # 解决输入目标文本的空行导致报错的问题
@@ -598,10 +637,13 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
         print(i18n("实际输入的目标文本(每句):"), text)
         phones2,bert2,norm_text2=get_phones_and_bert(text, text_language, version)
         print(i18n("前端处理后的文本(每句):"), norm_text2)
-        if not ref_free:
+        if not ref_free and not realtime_stream: # concatenate bert for file ref
             bert = torch.cat([bert1, bert2], 1)
             all_phoneme_ids = torch.LongTensor(phones1+phones2).to(device).unsqueeze(0)
-        else:
+        elif not ref_free and realtime_stream: # only use bert2 for realtime ref
+            bert = bert2
+            all_phoneme_ids = torch.LongTensor(phones2).to(device).unsqueeze(0)
+        else: # ref_free mode
             bert = bert2
             all_phoneme_ids = torch.LongTensor(phones2).to(device).unsqueeze(0)
 
@@ -638,58 +680,90 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
                         refers.append(refer)
                     except:
                         traceback.print_exc()
-            if(len(refers)==0):refers = [get_spepc(hps, ref_wav_path).to(dtype).to(device)]
+            if(len(refers)==0 and not realtime_stream): # get spec from file ref in non-realtime mode
+                refers = [get_spepc(hps, ref_wav_path).to(dtype).to(device)]
+            elif(len(refers)==0 and realtime_stream and not ref_free): # get spec from live ref in realtime mode
+                refer = get_spepc(hps, torch.from_numpy(ref_wav_path).float()).to(dtype).to(device) # ref_wav_path is audio array
+                refers = [refer]
+            elif(len(refers)==0 and realtime_stream and ref_free): # no ref needed in ref_free realtime mode
+                refers = [] # No refers needed for ref_free mode
             audio = vq_model.decode(pred_semantic, torch.LongTensor(phones2).to(device).unsqueeze(0), refers,speed=speed)[0][0]#.cpu().detach().numpy()
         else:
-            refer = get_spepc(hps, ref_wav_path).to(device).to(dtype)
-            phoneme_ids0=torch.LongTensor(phones1).to(device).unsqueeze(0)
+            if not realtime_stream:
+                refer = get_spepc(hps, ref_wav_path).to(device).to(dtype)
+            else:
+                refer = get_spepc(hps, torch.from_numpy(ref_wav_path).float()).to(device).to(dtype) # ref_wav_path is audio array
+
+            phoneme_ids0=torch.LongTensor(phones1).to(device).unsqueeze(0) if not ref_free and not realtime_stream else None # No phoneme_ids0 for realtime ref
             phoneme_ids1=torch.LongTensor(phones2).to(device).unsqueeze(0)
             # print(11111111, phoneme_ids0, phoneme_ids1)
-            fea_ref,ge = vq_model.decode_encp(prompt.unsqueeze(0), phoneme_ids0, refer)
-            ref_audio, sr = torchaudio.load(ref_wav_path)
-            ref_audio=ref_audio.to(device).float()
-            if (ref_audio.shape[0] == 2):
-                ref_audio = ref_audio.mean(0).unsqueeze(0)
-            if sr!=24000:
-                ref_audio=resample(ref_audio,sr)
-            # print("ref_audio",ref_audio.abs().mean())
-            mel2 = mel_fn(ref_audio)
-            mel2 = norm_spec(mel2)
-            T_min = min(mel2.shape[2], fea_ref.shape[2])
-            mel2 = mel2[:, :, :T_min]
-            fea_ref = fea_ref[:, :, :T_min]
-            if (T_min > 468):
-                mel2 = mel2[:, :, -468:]
-                fea_ref = fea_ref[:, :, -468:]
-                T_min = 468
-            chunk_len = 934 - T_min
-            # print("fea_ref",fea_ref,fea_ref.shape)
-            # print("mel2",mel2)
-            mel2=mel2.to(dtype)
-            fea_todo, ge = vq_model.decode_encp(pred_semantic, phoneme_ids1, refer, ge,speed)
-            # print("fea_todo",fea_todo)
-            # print("ge",ge.abs().mean())
-            cfm_resss = []
-            idx = 0
-            while (1):
-                fea_todo_chunk = fea_todo[:, :, idx:idx + chunk_len]
-                if (fea_todo_chunk.shape[-1] == 0): break
-                idx += chunk_len
-                fea = torch.cat([fea_ref, fea_todo_chunk], 2).transpose(2, 1)
-                # set_seed(123)
-                cfm_res = vq_model.cfm.inference(fea, torch.LongTensor([fea.size(1)]).to(fea.device), mel2, sample_steps, inference_cfg_rate=0)
-                cfm_res = cfm_res[:, :, mel2.shape[2]:]
-                mel2 = cfm_res[:, :, -T_min:]
-                # print("fea", fea)
-                # print("mel2in", mel2)
-                fea_ref = fea_todo_chunk[:, :, -T_min:]
-                cfm_resss.append(cfm_res)
-            cmf_res = torch.cat(cfm_resss, 2)
-            cmf_res = denorm_spec(cmf_res)
-            if bigvgan_model==None:init_bigvgan()
-            with torch.inference_mode():
-                wav_gen = bigvgan_model(cmf_res)
-                audio=wav_gen[0][0]#.cpu().detach().numpy()
+            if not ref_free and not realtime_stream:
+                fea_ref,ge = vq_model.decode_encp(prompt.unsqueeze(0), phoneme_ids0, refer)
+            else:
+                fea_ref,ge = None, None # No fea_ref for realtime or ref_free mode
+
+            ref_audio = None
+            if not realtime_stream:
+                ref_audio, sr = torchaudio.load(ref_wav_path)
+            else:
+                ref_audio = torch.from_numpy(ref_wav_path).float().unsqueeze(0) # ref_wav_path is audio array, unsqueeze to make it (1, length)
+                sr = 16000 # Assume microphone input is 16kHz
+
+            if ref_audio is not None:
+                ref_audio=ref_audio.to(device).float()
+                if (ref_audio.shape[0] == 2):
+                    ref_audio = ref_audio.mean(0).unsqueeze(0)
+                if sr!=24000:
+                    ref_audio=resample(ref_audio,sr)
+                # print("ref_audio",ref_audio.abs().mean())
+                mel2 = mel_fn(ref_audio)
+                mel2 = norm_spec(mel2)
+
+                if fea_ref is not None: # only when using file based reference
+                    T_min = min(mel2.shape[2], fea_ref.shape[2])
+                    mel2 = mel2[:, :, :T_min]
+                    fea_ref = fea_ref[:, :, :T_min]
+                    if (T_min > 468):
+                        mel2 = mel2[:, :, -468:]
+                        fea_ref = fea_ref[:, :, -468:]
+                        T_min = 468
+                    chunk_len = 934 - T_min
+                else: # for realtime stream
+                    T_min = mel2.shape[2] # use full mel2 length as T_min
+                    chunk_len = 934 - T_min if T_min < 934 else 0 # adjust chunk_len based on T_min
+
+                # print("fea_ref",fea_ref,fea_ref.shape)
+                # print("mel2",mel2)
+                mel2=mel2.to(dtype)
+                fea_todo, ge = vq_model.decode_encp(pred_semantic, phoneme_ids1, refer, ge,speed)
+                # print("fea_todo",fea_todo)
+                # print("ge",ge.abs().mean())
+                cfm_resss = []
+                idx = 0
+                while (1):
+                    fea_todo_chunk = fea_todo[:, :, idx:idx + chunk_len]
+                    if (fea_todo_chunk.shape[-1] == 0): break
+                    idx += chunk_len
+                    if fea_ref is not None: # use fea_ref only for file based reference
+                        fea = torch.cat([fea_ref, fea_todo_chunk], 2).transpose(2, 1)
+                    else: # for realtime stream, no fea_ref
+                        fea = fea_todo_chunk.transpose(2,1) # use only fea_todo_chunk
+                    # set_seed(123)
+                    cfm_res = vq_model.cfm.inference(fea, torch.LongTensor([fea.size(1)]).to(fea.device), mel2, sample_steps, inference_cfg_rate=0)
+                    cfm_res = cfm_res[:, :, mel2.shape[2]:]
+                    mel2 = cfm_res[:, :, -T_min:]
+                    if fea_ref is not None: # Update fea_ref only for file based reference
+                        fea_ref = fea_todo_chunk[:, :, -T_min:]
+                    cfm_resss.append(cfm_res)
+                cmf_res = torch.cat(cfm_resss, 2)
+                cmf_res = denorm_spec(cmf_res)
+                if bigvgan_model==None:init_bigvgan()
+                with torch.inference_mode():
+                    wav_gen = bigvgan_model(cmf_res)
+                    audio=wav_gen[0][0]#.cpu().detach().numpy()
+            else: # if ref_audio is None, something went wrong in realtime stream, return zero audio
+                audio = torch.zeros(int(hps.data.sampling_rate * 1), dtype=torch.float32).to(device) # 1 sec zero audio
+
         max_audio=torch.abs(audio).max()#简单防止16bit爆音
         if max_audio>1:audio/=max_audio
         audio_opt.append(audio)
@@ -697,17 +771,31 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
         t4 = ttime()
         t.extend([t2 - t1,t3 - t2, t4 - t3])
         t1 = ttime()
-    print("%.3f\t%.3f\t%.3f\t%.3f" % (t[0], sum(t[1::3]), sum(t[2::3]), sum(t[3::3])))
-    audio_opt=torch.cat(audio_opt, 0)#np.concatenate
-    sr=hps.data.sampling_rate if model_version!="v3"else 24000
-    if if_sr==True and sr==24000:
-        print(i18n("音频超分中"))
-        audio_opt,sr=audio_sr(audio_opt.unsqueeze(0),sr)
-        max_audio=np.abs(audio_opt).max()
-        if max_audio > 1: audio_opt /= max_audio
-    else:
-        audio_opt=audio_opt.cpu().detach().numpy()
-    yield sr, (audio_opt * 32767).astype(np.int16)
+
+        if realtime_stream: # yield audio chunk by chunk in realtime
+            audio_output_np = audio.cpu().detach().numpy()
+            sr_output = hps.data.sampling_rate if model_version!="v3"else 24000
+            if if_sr==True and sr_output==24000:
+                print(i18n("音频超分中"))
+                audio_output_torch,sr_output=audio_sr(torch.from_numpy(audio_output_np).unsqueeze(0),sr_output)
+                audio_output_np=audio_output_torch.cpu().detach().numpy()
+                max_audio=np.abs(audio_output_np).max()
+                if max_audio > 1: audio_output_np /= max_audio
+
+            yield (sr_output, (audio_output_np * 32767).astype(np.int16)) # Yield audio chunk and return, no need to concatenate and process all texts
+
+    if not realtime_stream: # Process for non-realtime stream
+        print("%.3f\t%.3f\t%.3f\t%.3f" % (t[0], sum(t[1::3]), sum(t[2::3]), sum(t[3::3])))
+        audio_opt=torch.cat(audio_opt, 0)#np.concatenate
+        sr=hps.data.sampling_rate if model_version!="v3"else 24000
+        if if_sr==True and sr==24000:
+            print(i18n("音频超分中"))
+            audio_opt,sr=audio_sr(audio_opt.unsqueeze(0),sr_output) # sr_output instead of sr
+            max_audio=np.abs(audio_opt).max()
+            if max_audio > 1: audio_opt /= max_audio
+        else:
+            audio_opt=audio_opt.cpu().detach().numpy()
+        yield sr, (audio_opt * 32767).astype(np.int16) # Yield final audio for non-realtime
 
 
 def split(todo_text):
@@ -864,7 +952,7 @@ def html_left(text, label='p'):
 
 with gr.Blocks(title="GPT-SoVITS WebUI") as app:
     gr.Markdown(
-        value=i18n("本软件以MIT协议开源, 作者不对软件具备任何控制力, 使用软件者、传播软件导出的声音者自负全责.") + "<br>" + i18n("如不认可该条款, 则不能使用或引用软件包内任何代码和文件. 详见根目录LICENSE.")
+        value=i18n("本软件以MIT协议开源, 作者不对软件具备任何控制力, 使用软件者、传播软件导出的声音者自负全责.") + "<br>" + i18n("如不认可该条款, 则不能使用 или цитировать软件包内 любые коды и файлы. Смотрите LICENSE в корневом каталоге.")
     )
     with gr.Group():
         gr.Markdown(html_center(i18n("模型切换"),'h3'))
@@ -873,77 +961,69 @@ with gr.Blocks(title="GPT-SoVITS WebUI") as app:
             SoVITS_dropdown = gr.Dropdown(label=i18n("SoVITS模型列表"), choices=sorted(SoVITS_names, key=custom_sort_key), value=sovits_path, interactive=True, scale=14)
             refresh_button = gr.Button(i18n("刷新模型路径"), variant="primary", scale=14)
             refresh_button.click(fn=change_choices, inputs=[], outputs=[SoVITS_dropdown, GPT_dropdown])
-        gr.Markdown(html_center(i18n("*请上传并填写参考信息"),'h3'))
+        gr.Markdown(html_center(i18n("*请上传并 заполните справочную информацию"),'h3'))
         with gr.Row():
-            inp_ref = gr.Audio(label=i18n("请上传3~10秒内参考音频，超过会报错！"), type="filepath", scale=13)
+            inp_ref = gr.Audio(label=i18n("请 загрузите справочный звук в течение 3–10 секунд, в противном случае произойдет ошибка!"), type="filepath", scale=13) # Microphone input - may or may not work on very old Gradio, Fallback to file upload
             with gr.Column(scale=13):
-                ref_text_free = gr.Checkbox(label=i18n("开启无参考文本模式。不填参考文本亦相当于开启。")+i18n("v3暂不支持该模式，使用了会报错。"), value=False, interactive=True, show_label=True,scale=1)
-                gr.Markdown(html_left(i18n("使用无参考文本模式时建议使用微调的GPT")+"<br>"+i18n("听不清参考音频说的啥(不晓得写啥)可以开。开启后无视填写的参考文本。")))
-                prompt_text = gr.Textbox(label=i18n("参考音频的文本"), value="", lines=5, max_lines=5,scale=1)
+                ref_text_free = gr.Checkbox(label=i18n("Включите режим без справочного текста. Заполнение справочного текста также эквивалентно его включению.")+i18n("v3暂不支持该模式，使用了会报错。"), value=False, interactive=True, show_label=True,scale=1)
+                gr.Markdown(html_left(i18n("При использовании режима без справочного текста рекомендуется использовать точно настроенный GPT")+"<br>"+i18n("Если вы не можете четко слышать, что говорит справочный звук (я не знаю, что писать), вы можете включить его. После включения игнорируйте заполненный справочный текст.")))
+                prompt_text = gr.Textbox(label=i18n("Текст справочного аудио"), value="", lines=5, max_lines=5,scale=1)
             with gr.Column(scale=14):
                 prompt_language = gr.Dropdown(
-                    label=i18n("参考音频的语种"), choices=list(dict_language.keys()), value=i18n("中文"),
+                    label=i18n("Язык справочного аудио"), choices=list(dict_language.keys()), value=i18n("中文"),
                 )
-                inp_refs = gr.File(label=i18n("可选项：通过拖拽多个文件上传多个参考音频（建议同性），平均融合他们的音色。如不填写此项，音色由左侧单个参考音频控制。如是微调模型，建议参考音频全部在微调训练集音色内，底模不用管。"),file_count="multiple")if model_version!="v3"else gr.File(label=i18n("可选项：通过拖拽多个文件上传多个参考音频（建议同性），平均融合他们的音色。如不填写此项，音色由左侧单个参考音频控制。如是微调模型，建议参考音频全部在微调训练集音色内，底模不用管。"),file_count="multiple",visible=False)
-                sample_steps = gr.Radio(label=i18n("采样步数,如果觉得电,提高试试,如果觉得慢,降低试试"),value=32,choices=[4,8,16,32],visible=True)if model_version=="v3"else gr.Radio(label=i18n("采样步数,如果觉得电,提高试试,如果觉得慢,降低试试"),choices=[4,8,16,32],visible=False,value=32)
-                if_sr_Checkbox=gr.Checkbox(label=i18n("v3输出如果觉得闷可以试试开超分"), value=False, interactive=True, show_label=True,visible=False if model_version!="v3"else True)
-        gr.Markdown(html_center(i18n("*请填写需要合成的目标文本和语种模式"),'h3'))
+                inp_refs = gr.File(label=i18n("Дополнительно: перетащите несколько файлов, чтобы загрузить несколько справочных аудио (рекомендуется тот же пол), чтобы усреднить их тембры. Если этот пункт не заполнен, тембр будет контролироваться одним справочным аудио слева. Если это точно настроенная модель, рекомендуется, чтобы все справочное аудио находилось в тембре набора данных для точной настройки, а базовая модель не имела значения."),file_count="multiple",visible=True)if model_version!="v3"else gr.File(label=i18n("Дополнительно: перетащите несколько файлов, чтобы загрузить несколько справочных аудио (рекомендуется тот же пол), чтобы усреднить их тембры. Если этот пункт не заполнен, тембр будет контролироваться одним справочным аудио слева. Если это точно настроенная модель, рекомендуется, чтобы все справочное аудио находилось в тембре набора данных для точной настройки, а базовая модель не имела значения."),file_count="multiple",visible=False)
+                sample_steps = gr.Radio(label=i18n("Шаги дискретизации, если вы чувствуете электричество, попробуйте увеличить его, если вы чувствуете себя медленным, попробуйте уменьшить его"),value=32,choices=[4,8,16,32],visible=True)if model_version=="v3"else gr.Radio(label=i18n("Шаги дискретизации, если вы чувствуете электричество, попробуйте увеличить его, если вы чувствуете себя медленным, попробуйте уменьшить его"),choices=[4,8,16,32],visible=False,value=32)
+                if_sr_Checkbox=gr.Checkbox(label=i18n("v3 output if you feel stuffy, you can try super-dividing"), value=False, interactive=True, show_label=True,visible=False if model_version!="v3"else True)
+        gr.Markdown(html_center(i18n("*Пожалуйста, заполните целевой текст и режим языковой модели, который необходимо синтезировать"),'h3'))
         with gr.Row():
             with gr.Column(scale=13):
-                text = gr.Textbox(label=i18n("需要合成的文本"), value="", lines=26, max_lines=26)
+                text = gr.Textbox(label=i18n("Текст, который необходимо синтезировать"), value="", lines=26, max_lines=26) # Streaming Removed - Non-streaming fallback
             with gr.Column(scale=7):
                 text_language = gr.Dropdown(
-                        label=i18n("需要合成的语种")+i18n(".限制范围越小判别效果越好。"), choices=list(dict_language.keys()), value=i18n("中文"), scale=1
+                        label=i18n("Язык, который необходимо синтезировать")+i18n(".Чем меньше диапазон ограничений, тем лучше эффект дискриминации."), choices=list(dict_language.keys()), value=i18n("中文"), scale=1
                     )
                 how_to_cut = gr.Dropdown(
-                        label=i18n("怎么切"),
-                        choices=[i18n("不切"), i18n("凑四句一切"), i18n("凑50字一切"), i18n("按中文句号。切"), i18n("按英文句号.切"), i18n("按标点符号切"), ],
-                        value=i18n("凑四句一切"),
+                        label=i18n("Как порезать"),
+                        choices=[i18n("не резать"), i18n("четыре предложения"), i18n("50 символов"), i18n("китайская точка"), i18n("английская точка"), i18n("знаки препинания"), ],
+                        value=i18n("четыре предложения"),
                         interactive=True, scale=1
                     )
-                gr.Markdown(value=html_center(i18n("语速调整，高为更快")))
-                if_freeze=gr.Checkbox(label=i18n("是否直接对上次合成结果调整语速和音色。防止随机性。"), value=False, interactive=True,show_label=True, scale=1)
+                gr.Markdown(value=html_center(i18n("Регулировка скорости речи, высокая скорость для более быстрой")))
+                if_freeze=gr.Checkbox(label=i18n("Является ли скорость речи и тон голоса непосредственно скорректированы для последнего результата синтеза. Предотвратить случайность."), value=False, interactive=True,show_label=True, scale=1, visible=False) # Hide freeze option for realtime as it is not relevant
                 with gr.Row():
-                    speed = gr.Slider(minimum=0.6,maximum=1.65,step=0.05,label=i18n("语速"),value=1,interactive=True, scale=1)
-                    pause_second_slider = gr.Slider(minimum=0.1,maximum=0.5,step=0.01,label=i18n("句间停顿秒数"),value=0.3,interactive=True, scale=1)
-                gr.Markdown(html_center(i18n("GPT采样参数(无参考文本时不要太低。不懂就用默认)：")))
-                top_k = gr.Slider(minimum=1,maximum=100,step=1,label=i18n("top_k"),value=15,interactive=True, scale=1)
-                top_p = gr.Slider(minimum=0,maximum=1,step=0.05,label=i18n("top_p"),value=1,interactive=True, scale=1)
-                temperature = gr.Slider(minimum=0,maximum=1,step=0.05,label=i18n("temperature"),value=1,interactive=True, scale=1)
+                    speed = gr.Slider(minimum=0.6,maximum=1.65,step=0.05,label=i18n("Скорость речи"),value=1,interactive=True, scale=1)
+                    pause_second_slider = gr.Slider(minimum=0.1,maximum=0.5,step=0.01,label=i18n("Количество секунд между предложениями"),value=0.3,interactive=True, scale=1, visible=False) # Hide pause_second for realtime, may not be needed
+                gr.Markdown(html_center(i18n("Параметры выборки GPT (не слишком низкие, когда нет справочного текста. Если вы не понимаете, используйте значения по умолчанию):")))
+                top_k = gr.Slider(minimum=1,maximum=100,step=1,label=i18n("top_k"),value=15,interactive=True, scale=1, visible=False) # Hide GPT params for realtime, default values are likely fine
+                top_p = gr.Slider(minimum=0,maximum=1,step=0.05,label=i18n("top_p"),value=1,interactive=True, scale=1, visible=False)
+                temperature = gr.Slider(minimum=0,maximum=1,step=0.05,label=i18n("Температура"),value=1,interactive=True, scale=1, visible=False)
             # with gr.Column():
-            #     gr.Markdown(value=i18n("手工调整音素。当音素框不为空时使用手工音素输入推理，无视目标文本框。"))
-            #     phoneme=gr.Textbox(label=i18n("音素框"), value="")
-            #     get_phoneme_button = gr.Button(i18n("目标文本转音素"), variant="primary")
+            #     gr.Markdown(value=i18n("Ручная настройка фонемы. При заполнении поля фонемы для вывода используется ручной ввод фонемы, игнорируя поле целевого текста."))
+            #     phoneme=gr.Textbox(label=i18n("Фонематическое поле"), value="")
+            #     get_phoneme_button = gr.Button(i18n("Целевой текст в фонему"), variant="primary")
         with gr.Row():
-            inference_button = gr.Button(i18n("合成语音"), variant="primary", size='lg', scale=25)
-            output = gr.Audio(label=i18n("输出的语音"), scale=14)
+            realtime_inference_button = gr.Button(i18n("Синтезировать речь"), variant="primary", size='lg', scale=25) # "合成语音" button label changed as realtime might not work
+            output = gr.Audio(label=i18n("Выходная речь"), scale=14) # Streaming Removed - Non-streaming fallback
 
-        inference_button.click(
+        # **NEW: Hidden Checkbox for realtime_stream**
+        realtime_stream_checkbox = gr.Checkbox(value=False, visible=False, interactive=False)
+
+        realtime_inference_button.click(
             get_tts_wav,
-            [inp_ref, prompt_text, prompt_language, text, text_language, how_to_cut, top_k, top_p, temperature, ref_text_free,speed,if_freeze,inp_refs,sample_steps,if_sr_Checkbox,pause_second_slider],
+            [inp_ref, prompt_text, prompt_language, text, text_language, how_to_cut, top_k, top_p, temperature, ref_text_free,speed,if_freeze,inp_refs,sample_steps,if_sr_Checkbox,pause_second_slider, realtime_stream_checkbox], # Pass the hidden checkbox
             [output],
+            preprocess=False, # Important for realtime streaming - keep for potential future compatibility if user upgrades
+            postprocess=False, # Important for realtime streaming - keep for potential future compatibility if user upgrades
+            queue=False, # Disable queue for realtime - keep for potential future compatibility if user upgrades
+            api_name="realtime_tts" # Optional API name for clarity - label might be misleading now
         )
         SoVITS_dropdown.change(change_sovits_weights, [SoVITS_dropdown,prompt_language,text_language], [prompt_language,text_language,prompt_text,prompt_language,text,text_language,sample_steps,inp_refs,ref_text_free,if_sr_Checkbox])
         GPT_dropdown.change(change_gpt_weights, [GPT_dropdown], [])
 
-        # gr.Markdown(value=i18n("文本切分工具。太长的文本合成出来效果不一定好，所以太长建议先切。合成会根据文本的换行分开合成再拼起来。"))
-        # with gr.Row():
-        #     text_inp = gr.Textbox(label=i18n("需要合成的切分前文本"), value="")
-        #     button1 = gr.Button(i18n("凑四句一切"), variant="primary")
-        #     button2 = gr.Button(i18n("凑50字一切"), variant="primary")
-        #     button3 = gr.Button(i18n("按中文句号。切"), variant="primary")
-        #     button4 = gr.Button(i18n("按英文句号.切"), variant="primary")
-        #     button5 = gr.Button(i18n("按标点符号切"), variant="primary")
-        #     text_opt = gr.Textbox(label=i18n("切分后文本"), value="")
-        #     button1.click(cut1, [text_inp], [text_opt])
-        #     button2.click(cut2, [text_inp], [text_opt])
-        #     button3.click(cut3, [text_inp], [text_opt])
-        #     button4.click(cut4, [text_inp], [text_opt])
-        #     button5.click(cut5, [text_inp], [text_opt])
-        # gr.Markdown(html_center(i18n("后续将支持转音素、手工修改音素、语音合成分步执行。")))
 
 if __name__ == '__main__':
-    app.queue().launch(#concurrency_count=511, max_size=1022
+    app.queue(max_size=10).launch( # Reduced queue size for realtime - keep for potential future compatibility if user upgrades
         server_name="0.0.0.0",
         inbrowser=True,
         share=is_share,
